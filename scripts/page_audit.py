@@ -14,6 +14,16 @@ reports the page-level problems that quietly cost a site its search traffic:
   * orphaned pages: published pages no other page links to
   * repeated phrasing: page pairs that share too much of their wording, and
     long sentences repeated verbatim on more than one page
+  * structured data: pages with no JSON-LD block, or a JSON-LD block that
+    is not valid JSON
+  * pages with no canonical link
+  * pages missing the og:title or og:description social meta tags
+  * images with no alt attribute
+  * site files (directory mode): a missing sitemap, sitemap entries that
+    point at pages which do not exist, built pages the sitemap leaves out,
+    a missing robots.txt, and a missing llms.txt; an IndexNow key file at
+    the site root is detected and reported (detection only, nothing is
+    ever submitted)
   * optional: forbidden terms appearing anywhere on a page (brand rules,
     competitor names, a former company name, anything you define)
 
@@ -37,6 +47,7 @@ Notes on inputs:
 """
 import argparse, fnmatch, html, json, os, re, sys
 import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
 TITLE_MIN, TITLE_MAX = 50, 60
@@ -64,6 +75,11 @@ class PageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title_parts, self.h1_texts, self.links = [], [], []
         self.description = None
+        self.canonical = None
+        self.og_title, self.og_description = False, False
+        self.img_total, self.img_no_alt = 0, 0
+        self.jsonld_blocks = []
+        self._jsonld_parts = None     # list while inside a JSON-LD script
         self.h1_count = 0
         self.text_parts = []          # body copy only (boilerplate excluded)
         self.all_text_parts = []      # everything visible (for --forbid)
@@ -84,8 +100,22 @@ class PageParser(HTMLParser):
                 self._boiler += 1
         if tag == "title":
             self._in_title = True
-        elif tag == "meta" and a.get("name", "").lower() == "description":
-            self.description = a.get("content", "")
+        elif tag == "meta":
+            if a.get("name", "").lower() == "description":
+                self.description = a.get("content", "")
+            prop = (a.get("property", "") or a.get("name", "")).lower()
+            if prop == "og:title":
+                self.og_title = True
+            elif prop == "og:description":
+                self.og_description = True
+        elif tag == "link" and "canonical" in a.get("rel", "").lower().split():
+            self.canonical = a.get("href", "")
+        elif tag == "script" and a.get("type", "").lower() == "application/ld+json":
+            self._jsonld_parts = []
+        elif tag == "img":
+            self.img_total += 1
+            if "alt" not in a:
+                self.img_no_alt += 1
         elif tag == "h1":
             self.h1_count += 1
             self._h1_parts = []
@@ -104,11 +134,16 @@ class PageParser(HTMLParser):
                 break
         if tag == "title":
             self._in_title = False
+        elif tag == "script" and self._jsonld_parts is not None:
+            self.jsonld_blocks.append("".join(self._jsonld_parts))
+            self._jsonld_parts = None
         elif tag == "h1" and self._h1_parts is not None:
             self.h1_texts.append(clean_text(" ".join(self._h1_parts)))
             self._h1_parts = None
 
     def handle_data(self, data):
+        if self._jsonld_parts is not None:
+            self._jsonld_parts.append(data)
         if self._in_title:
             self.title_parts.append(data)
         if self._h1_parts is not None:
@@ -143,6 +178,10 @@ class Page:
         self.description = clean_text(p.description) if p.description is not None else None
         self.h1_count, self.h1_texts = p.h1_count, p.h1_texts
         self.links = p.links
+        self.canonical = p.canonical
+        self.og_title, self.og_description = p.og_title, p.og_description
+        self.img_total, self.img_no_alt = p.img_total, p.img_no_alt
+        self.jsonld_blocks = p.jsonld_blocks
         body = clean_text(" ".join(p.text_parts))
         self.all_text = clean_text(" ".join(p.all_text_parts))
         words = re.findall(r"[a-z0-9']+", body.lower())
@@ -155,9 +194,96 @@ class Page:
                 self.sentences[s] = True
 
 
+INDEXNOW_STEM = re.compile(r"^[0-9A-Za-z]{8,128}$")
+
+
+def _sitemap_locs(path):
+    """(is_index, [loc, ...]) for one sitemap XML file, or None if the file
+    cannot be read or parsed."""
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+    locs = [el.text.strip() for el in root.iter()
+            if el.tag.rsplit("}", 1)[-1] == "loc" and el.text and el.text.strip()]
+    return root.tag.rsplit("}", 1)[-1] == "sitemapindex", locs
+
+
+def collect_site_info(disk_root):
+    """Site-level facts from a build directory: robots.txt, llms.txt, the
+    sitemap (root sitemap.xml, child sitemaps of an index, or one named in
+    robots.txt), and an IndexNow key file. Detection only: nothing here is
+    fetched or submitted anywhere."""
+    site = {"checked": disk_root is not None, "robots": False, "llms": False,
+            "sitemap_found": False, "sitemap_unparseable": False,
+            "sitemap_entries": [], "indexnow_key": None}
+    if disk_root is None:
+        return site
+    robots_path = os.path.join(disk_root, "robots.txt")
+    site["robots"] = os.path.isfile(robots_path)
+    site["llms"] = os.path.isfile(os.path.join(disk_root, "llms.txt"))
+
+    candidates = []
+    root_sitemap = os.path.join(disk_root, "sitemap.xml")
+    if os.path.isfile(root_sitemap):
+        candidates.append(root_sitemap)
+    if site["robots"]:
+        try:
+            for line in open(robots_path, encoding="utf-8", errors="replace"):
+                if line.lower().startswith("sitemap:"):
+                    p = urllib.parse.urlparse(line.split(":", 1)[1].strip()).path
+                    f = os.path.join(disk_root, urllib.parse.unquote(p).lstrip("/"))
+                    if os.path.isfile(f) and f not in candidates:
+                        candidates.append(f)
+        except OSError:
+            pass
+    seen_files = set()
+    queue = list(candidates)
+    while queue:
+        f = queue.pop(0)
+        if f in seen_files:
+            continue
+        seen_files.add(f)
+        parsed = _sitemap_locs(f)
+        if parsed is None:
+            site["sitemap_unparseable"] = True
+            continue
+        site["sitemap_found"] = True
+        is_index, locs = parsed
+        if is_index:
+            for loc in locs:
+                child = os.path.join(
+                    disk_root, urllib.parse.unquote(urllib.parse.urlparse(loc).path).lstrip("/"))
+                if os.path.isfile(child):
+                    queue.append(child)
+        else:
+            for loc in locs:
+                path = urllib.parse.unquote(urllib.parse.urlparse(loc).path)
+                site["sitemap_entries"].append((canon(path), path))
+
+    try:
+        for name in os.listdir(disk_root):
+            if not name.endswith(".txt"):
+                continue
+            stem = name[:-4]
+            if INDEXNOW_STEM.match(stem):
+                try:
+                    content = open(os.path.join(disk_root, name),
+                                   encoding="utf-8", errors="replace").read().strip()
+                except OSError:
+                    continue
+                if content == stem:
+                    site["indexnow_key"] = stem
+                    break
+    except OSError:
+        pass
+    return site
+
+
 def load_targets(targets, excludes):
-    """Returns (pages, file_exists, hosts): hosts are the site hosts seen in
-    URL targets, used to tell internal absolute links from external ones."""
+    """Returns (pages, file_exists, hosts, site): hosts are the site hosts
+    seen in URL targets, used to tell internal absolute links from external
+    ones; site carries the site-file facts in directory mode."""
     pages, disk_root, hosts = {}, None, set()
 
     def wanted(rel):
@@ -198,7 +324,7 @@ def load_targets(targets, excludes):
             return False
         return os.path.isfile(os.path.join(disk_root, urllib.parse.unquote(path).lstrip("/")))
 
-    return pages, file_exists, hosts
+    return pages, file_exists, hosts, collect_site_info(disk_root)
 
 
 def looks_like_page(path):
@@ -206,7 +332,7 @@ def looks_like_page(path):
     return "." not in last or last.lower().endswith((".html", ".htm"))
 
 
-def audit(pages, file_exists, hosts, args):
+def audit(pages, file_exists, hosts, args, site):
     problems = []   # (section, message)
     add = problems.append
 
@@ -229,6 +355,22 @@ def audit(pages, file_exists, hosts, args):
                 add(("Descriptions", f"{key}: pipe or separator dash in description: {d}"))
         if pg.h1_count != 1:
             add(("Headings", f"{key}: {pg.h1_count} H1 elements (want exactly 1)"))
+        if not pg.jsonld_blocks:
+            add(("Structured data", f"{key}: no JSON-LD structured data block"))
+        for i, block in enumerate(pg.jsonld_blocks, 1):
+            try:
+                json.loads(block)
+            except ValueError as e:
+                add(("Structured data",
+                     f"{key}: JSON-LD block {i} is not valid JSON ({e.msg} at line {e.lineno})"))
+        if not pg.canonical:
+            add(("Canonical", f"{key}: no canonical link"))
+        if not pg.og_title:
+            add(("Social meta", f"{key}: no og:title meta tag"))
+        if not pg.og_description:
+            add(("Social meta", f"{key}: no og:description meta tag"))
+        if pg.img_no_alt:
+            add(("Images", f"{key}: {pg.img_no_alt} of {pg.img_total} images have no alt attribute"))
         for term in args.forbid:
             if re.search(re.escape(term), pg.all_text + " " + pg.title + " " + (d or ""), re.I):
                 add(("Forbidden terms", f"{key}: contains forbidden term {term!r}"))
@@ -278,6 +420,27 @@ def audit(pages, file_exists, hosts, args):
         if key != "/" and not inbound[key]:
             add(("Orphans", f"{key}: no inbound internal links (orphaned page)"))
 
+    # Site files (directory mode only): sitemap coverage and the discovery
+    # files answer engines read.
+    if site["checked"]:
+        if site["sitemap_unparseable"] and not site["sitemap_found"]:
+            add(("Sitemap", "a sitemap file exists but could not be parsed as XML"))
+        elif not site["sitemap_found"]:
+            add(("Sitemap", "no sitemap.xml at the site root and no sitemap referenced in robots.txt"))
+        else:
+            listed = {k for k, _ in site["sitemap_entries"]}
+            for k, raw in site["sitemap_entries"]:
+                if k not in pages and not file_exists(raw):
+                    add(("Sitemap", f"sitemap lists {raw}, which is not in the site tree"))
+            for key in sorted(pages):
+                if key not in listed:
+                    add(("Sitemap", f"{key}: built page is not listed in the sitemap"))
+        if not site["robots"]:
+            add(("Discovery files", "robots.txt is missing from the site root"))
+        if not site["llms"]:
+            add(("Discovery files", "llms.txt is missing from the site root "
+                                    "(the file AI answer engines read to learn the site)"))
+
     keys = sorted(pages)
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
@@ -317,7 +480,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     try:
-        pages, file_exists, hosts = load_targets(args.targets, args.exclude)
+        pages, file_exists, hosts, site = load_targets(args.targets, args.exclude)
     except SystemExit:
         raise
     except Exception as e:
@@ -327,15 +490,30 @@ def main(argv=None):
         print("error: no pages found in the given targets", file=sys.stderr)
         return 2
 
-    problems = audit(pages, file_exists, hosts, args)
+    problems = audit(pages, file_exists, hosts, args, site)
+    site_facts = None
+    if site["checked"]:
+        site_facts = {"robots_txt": site["robots"], "llms_txt": site["llms"],
+                      "sitemap": site["sitemap_found"],
+                      "sitemap_urls": len(site["sitemap_entries"]),
+                      "indexnow_key_file": site["indexnow_key"] is not None}
     if args.json:
-        out = {"pages": len(pages), "problem_count": len(problems),
+        out = {"pages": len(pages), "problem_count": len(problems), "site": site_facts,
                "problems": [{"section": s, "message": m} for s, m in problems]}
         print(json.dumps(out, indent=2))
     else:
         print(f"PageyMcPageface audit: {len(pages)} pages, {len(problems)} problems")
-        order = ["Titles", "Descriptions", "Headings", "Duplicates", "Forbidden terms",
-                 "Missing pages", "Orphans", "Repeated phrasing"]
+        if site_facts is not None:
+            def yn(b):
+                return "present" if b else "MISSING"
+            print(f"Site files: robots.txt {yn(site_facts['robots_txt'])}, "
+                  f"sitemap {yn(site_facts['sitemap'])} ({site_facts['sitemap_urls']} URLs), "
+                  f"llms.txt {yn(site_facts['llms_txt'])}, "
+                  f"IndexNow key file {yn(site_facts['indexnow_key_file'])}")
+        order = ["Titles", "Descriptions", "Headings", "Structured data", "Canonical",
+                 "Social meta", "Images", "Duplicates", "Forbidden terms",
+                 "Missing pages", "Orphans", "Sitemap", "Discovery files",
+                 "Repeated phrasing"]
         grouped = {}
         for s, m in problems:
             grouped.setdefault(s, []).append(m)

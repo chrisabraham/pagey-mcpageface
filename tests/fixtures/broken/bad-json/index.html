@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bad JSON Page</title>
+<meta name="description" content="Short.">
+<link rel="canonical" href="https://example.com/bad-json/">
+<meta property="og:title" content="Bad JSON Page">
+<meta property="og:description" content="A page whose structured data is broken.">
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "WebPage", "name": "Bad JSON",}
+</script>
+</head>
+<body>
+<nav><a href="/">Home</a> <a href="/bad-json/">Bad JSON</a></nav>
+<main>
+<h1>Bad JSON Page</h1>
+<p>The structured data block on this page ends with a trailing comma, which
+is not valid JSON, and the audit is expected to say exactly that.</p>
+</main>
+</body>
+</html>

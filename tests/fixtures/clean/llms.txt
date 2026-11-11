@@ -1,0 +1,3 @@
+# Clean Fixture
+
+A demonstration site that passes the full audit.

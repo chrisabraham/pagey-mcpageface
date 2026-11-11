@@ -1,6 +1,6 @@
 ---
 name: PageyMcPageface
-description: Whole-site page hygiene audit for static sites. Checks every page's title and meta description length and characters, duplicate titles/descriptions/H1s, pages with zero or multiple H1s, internal links to missing pages, orphaned pages with no inbound links, and repeated boilerplate phrasing across pages. Use when a user asks for an SEO audit, a site quality check, a pre-launch or post-migration review, or why pages are not ranking or indexing.
+description: Whole-site page hygiene audit for static sites. Checks every page's title and meta description length and characters, duplicate titles/descriptions/H1s, pages with zero or multiple H1s, internal links to missing pages, orphaned pages with no inbound links, repeated boilerplate phrasing across pages, missing or invalid JSON-LD structured data, missing canonical links, missing og:title/og:description social meta, images with no alt attribute, and (in directory mode) sitemap coverage plus the robots.txt and llms.txt discovery files, with IndexNow key-file detection. Use when a user asks for an SEO audit, an AEO or answer-engine readiness check, a site quality check, a pre-launch or post-migration review, or why pages are not ranking or indexing.
 ---
 
 # PageyMcPageface — whole-site page hygiene audit
@@ -29,6 +29,13 @@ files, or a list of live page URLs.
 | No orphaned pages | Every page (except the home page) has at least one inbound internal link | A page nothing links to is a page crawlers and visitors rarely find |
 | Phrasing overlap between any two pages | At most 15% shared six-word phrases, measured against the smaller page | Near-duplicate pages compete with each other and get treated as duplicates |
 | Repeated sentences | No sentence of 10+ words may appear on more than one page | Verbatim repetition is the clearest near-duplicate signal there is |
+| Structured data | Every page carries at least one JSON-LD block, and every block parses as valid JSON | Schema that does not parse is schema no search or answer engine can use |
+| Canonical link | Every page carries one | The canonical is the page's own statement of its true URL; without it, engines guess |
+| Social meta | Every page carries `og:title` and `og:description` | These are the title and summary every share, embed, and answer card falls back to |
+| Image alt text | Every `<img>` carries an `alt` attribute | Alt text is how images are read by screen readers, image search, and answer engines |
+| Sitemap (directory mode) | `sitemap.xml` exists (or is named in robots.txt), lists every built page, and lists nothing that is not in the tree | The sitemap is the site's own table of contents for crawlers; gaps and ghosts both cost discovery |
+| Discovery files (directory mode) | `robots.txt` and `llms.txt` present at the site root | robots.txt is the crawlers' front door; llms.txt is the file AI answer engines read to learn the site |
+| IndexNow key file (directory mode) | Detected and reported when present; never a pass/fail rule | Detection only: the audit reports the key file, it submits nothing anywhere |
 | Forbidden terms (optional) | Your list | Catches a former brand name, a competitor's name, a partner's trademark, or any term a site has ruled off its own pages |
 
 Thresholds are defaults from practice, not laws. Every one is a command-line
@@ -57,9 +64,11 @@ the audit enforces those.
    generator's source files alongside its output, audit the output only.
 3. **Run the script** (below). Add `--forbid "Term"` once per forbidden
    term if the site has brand rules.
-4. **Read the report by section, worst first.** Missing pages and orphans
-   are structural and outrank wording. Duplicates and repeated phrasing
-   come next. Title and description lengths are the polish layer.
+4. **Read the report by section, worst first.** Missing pages, orphans,
+   and sitemap gaps are structural and outrank wording. Structured data,
+   canonical, and discovery-file findings come next: they decide whether
+   machines can read the site at all. Duplicates and repeated phrasing
+   follow. Title and description lengths are the polish layer.
 5. **Fix at the source, never in the output.** If pages are generated, fix
    the template or the source file and rebuild. Editing built HTML by hand
    is a fix that evaporates on the next build.
@@ -122,8 +131,36 @@ script drops straight into a build pipeline or a pre-push hook.
   never triggers it. Two measures are reported: the share of six-word
   phrases two pages hold in common, and any sentence of ten or more words
   appearing verbatim on more than one page.
+- **Structured data** collects every `<script type="application/ld+json">`
+  block on the page and parses each one as JSON. A page with no block, or
+  a block that fails to parse (a trailing comma is the usual killer), is
+  reported with the parser's own error.
+- **Canonical and social meta** read the `<link rel="canonical">` and the
+  `og:title` / `og:description` meta tags from the head. Presence is what
+  is checked; the audit does not judge the values.
+- **Image alt text** counts every `<img>` with no `alt` attribute at all.
+  An empty `alt=""` is a deliberate decorative marker and passes.
+- **Site files** are checked in directory mode only, against the build
+  root: `robots.txt`, `llms.txt`, and the sitemap. The sitemap is the
+  root `sitemap.xml`, the children of a sitemap index, or a sitemap named
+  in robots.txt. Every entry must resolve to an audited page or a file in
+  the tree, and every audited page must be listed. An IndexNow key file
+  (a `.txt` file at the root whose name and contents are the same key) is
+  detected and shown in the site-files line and the JSON `site` object.
+  Detection only: nothing is submitted to IndexNow or anywhere else.
 - **Forbidden terms** are matched case-insensitively against the page's
   full visible text, title, and description.
+
+## The answer-engine surface
+
+Search engines and AI answer engines (the AEO, AIO, and GEO channels)
+read a site through its machine-readable layer: the structured data on
+each page, the canonical URLs, the sitemap, robots.txt, and llms.txt.
+Pagey verifies that layer is present and sound (valid JSON-LD on every
+page, a canonical on every page, a sitemap that matches the tree,
+discovery files in place) alongside the classic on-page rulebook. It
+verifies; it does not promise placement in any engine's answers, and no
+honest tool can.
 
 ## Limits, stated plainly
 
@@ -134,3 +171,7 @@ script drops straight into a build pipeline or a pre-push hook.
 - It judges pages against each other and against the rulebook. It does not
   fetch search-engine data, and it cannot say which page *should* rank —
   only which pages are tripping over each other.
+- Site-file checks (sitemap, robots.txt, llms.txt, IndexNow detection)
+  run in directory mode only: they judge a build tree, and a list of URLs
+  has no root to judge. IndexNow support is detection of the key file;
+  the audit never submits URLs to IndexNow or to any engine.
